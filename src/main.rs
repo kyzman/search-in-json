@@ -39,8 +39,11 @@ fn main() -> Result<(), std::io::Error> {
     let start = Instant::now();
     println!("Результаты поиска для: \"{}\"\n", args.search_query);
 
+    // Проверяем, поддерживает ли окружение цвета (is_terminal вернет false при перенаправлении в файл)
+    let use_colors = stdout().is_terminal();
+
     // 3. Запуск поиска от корня ("$")
-    search_in_json(&out, &args.search_query, "$");
+    search_in_json(&out, &args.search_query, "$", use_colors);
     // println!("{}", serde_json::to_string_pretty(&out)?);
     // let mut archive = Archive::new(tar);
     // archive.unpack(".")?;
@@ -77,50 +80,79 @@ fn clean_json_value(value: &mut Value) {
     }
 }
 
-fn search_in_json(value: &Value, query: &str, current_path: &str) {
+fn search_in_json(value: &Value, query: &str, current_path: &str, use_colors: bool) {
+    if query.is_empty() {
+        return;
+    }
     let query_lowercase = query.to_lowercase();
 
     match value {
-        // Если элемент — это JSON-объект (Map)
         Value::Object(obj) => {
             for (key, val) in obj {
-                // Строим путь для текущего ключа
                 let next_path = format!("{}.{}", current_path, key);
 
-                // А. Проверяем, совпадает ли сам КЛЮЧ
+                // А. Проверка КЛЮЧА
                 if key.to_lowercase().contains(&query_lowercase) {
+                    let highlighted_key = highlight_match(key, &query_lowercase, use_colors);
                     println!("[Найдено в КЛЮЧЕ]");
-                    println!("Путь: {}", next_path);
+                    // Подсвечиваем совпадение в самом пути
+                    println!("Путь: {}.{}", current_path, highlighted_key);
                     println!("Значение по этому ключу: {}\n", truncate_value(val));
                 }
 
-                // Б. Идем глубже в значение по этому ключу
-                search_in_json(val, query, &next_path);
+                search_in_json(val, query, &next_path, use_colors);
             }
         }
-        // Если элемент — это массив
         Value::Array(arr) => {
             for (index, item) in arr.iter().enumerate() {
-                // Строим путь с индексом массива, например: $.key[0]
                 let next_path = format!("{}[{}]", current_path, index);
-                search_in_json(item, query, &next_path);
+                search_in_json(item, query, &next_path, use_colors);
             }
         }
-        // Если элемент — это строка (Значение)
         Value::String(s) => {
-            // В. Проверяем, совпадает ли ЗНАЧЕНИЕ
+            // Б. Проверка ЗНАЧЕНИЯ
             if s.to_lowercase().contains(&query_lowercase) {
+                let highlighted_text = highlight_match(s, &query_lowercase, use_colors);
                 println!("[Найдено в ЗНАЧЕНИИ]");
                 println!("Путь: {}", current_path);
-                println!("Текст: \"{}\"\n", s);
+                println!("Текст: \"{}\"\n", highlighted_text);
             }
         }
-        // Числа, булевы значения и null игнорируем (или можно добавить при желании)
         _ => {}
     }
 }
 
-// Вспомогательная функция, чтобы не выводить слишком огромные объекты в консоль при совпадении ключа
+/// Функция для инвертирования цвета подстроки с сохранением оригинального регистра букв
+fn highlight_match(original: &str, query_lowercase: &str, use_colors: bool) -> String {
+    if !use_colors {
+        return original.to_string();
+    }
+
+    let mut result = String::new();
+    let original_lowercase = original.to_lowercase();
+    let mut current_idx = 0;
+
+    // Ищем все вхождения подстроки
+    while let Some(match_start_byte) = original_lowercase[current_idx..].find(query_lowercase) {
+        let absolute_start = current_idx + match_start_byte;
+        let absolute_end = absolute_start + query_lowercase.len();
+
+        // Добавляем текст ДО совпадения
+        result.push_str(&original[current_idx..absolute_start]);
+
+        // Добавляем совпадение с ANSI-инверсией (\x1b[7m — инверсия, \x1b[0m — сброс)
+        result.push_str("\x1b[7m");
+        result.push_str(&original[absolute_start..absolute_end]);
+        result.push_str("\x1b[0m");
+
+        current_idx = absolute_end;
+    }
+
+    // Добавляем оставшуюся часть строки
+    result.push_str(&original[current_idx..]);
+    result
+}
+
 fn truncate_value(val: &Value) -> String {
     let s = serde_json::to_string(val).unwrap_or_default();
     if s.len() > 150 {
