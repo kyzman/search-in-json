@@ -4,6 +4,7 @@ use clap::Parser;
 use flate2::read::GzDecoder;
 use serde_json;
 use serde_json::Value;
+use std::env::args;
 use std::fs::File;
 use std::io::{IsTerminal, Read, stdout};
 use std::time::Instant;
@@ -16,14 +17,21 @@ struct Args {
 
     #[arg(short = 's', long = "search")]
     search_query: String,
+
+    #[arg(short = 'm', long = "mono-colors")]
+    mono: bool,
+
+    #[arg(short = 'v', long = "verbose")]
+    verbose: bool,
 }
 
 fn main() -> Result<(), std::io::Error> {
-    let args = Args::parse();
+    let start = Instant::now();
     print!("Загрузка и распаковка JSON...");
+
+    let args = Args::parse();
     // let path = "archive_90.json.gz";
     let path = args.file;
-    let start = Instant::now();
     let tar_gz = File::open(path)?;
     let mut tar = GzDecoder::new(tar_gz);
     let mut buf = String::new();
@@ -40,10 +48,12 @@ fn main() -> Result<(), std::io::Error> {
     println!("Результаты поиска для: \"{}\"\n", args.search_query);
 
     // Проверяем, поддерживает ли окружение цвета (is_terminal вернет false при перенаправлении в файл)
-    let use_colors = stdout().is_terminal();
-
+    let mut use_colors = false;
+    if !args.mono {
+        use_colors = stdout().is_terminal();
+    }
     // 3. Запуск поиска от корня ("$")
-    search_in_json(&out, &args.search_query, "$", use_colors);
+    search_in_json(&out, &args.search_query, "$", use_colors, args.verbose);
     // println!("{}", serde_json::to_string_pretty(&out)?);
     // let mut archive = Archive::new(tar);
     // archive.unpack(".")?;
@@ -80,7 +90,7 @@ fn clean_json_value(value: &mut Value) {
     }
 }
 
-fn search_in_json(value: &Value, query: &str, current_path: &str, use_colors: bool) {
+fn search_in_json(value: &Value, query: &str, current_path: &str, use_colors: bool, verbose: bool) {
     if query.is_empty() {
         return;
     }
@@ -97,16 +107,18 @@ fn search_in_json(value: &Value, query: &str, current_path: &str, use_colors: bo
                     println!("[Найдено в КЛЮЧЕ]");
                     // Подсвечиваем совпадение в самом пути
                     println!("Путь: {}.{}", current_path, highlighted_key);
-                    println!("Значение по этому ключу: {}\n", truncate_value(val));
+                    if verbose {
+                        println!("Значение по этому ключу: {}\n", truncate_value(val))
+                    };
                 }
 
-                search_in_json(val, query, &next_path, use_colors);
+                search_in_json(val, query, &next_path, use_colors, verbose);
             }
         }
         Value::Array(arr) => {
             for (index, item) in arr.iter().enumerate() {
                 let next_path = format!("{}[{}]", current_path, index);
-                search_in_json(item, query, &next_path, use_colors);
+                search_in_json(item, query, &next_path, use_colors, verbose);
             }
         }
         Value::String(s) => {
@@ -115,7 +127,9 @@ fn search_in_json(value: &Value, query: &str, current_path: &str, use_colors: bo
                 let highlighted_text = highlight_match(s, &query_lowercase, use_colors);
                 println!("[Найдено в ЗНАЧЕНИИ]");
                 println!("Путь: {}", current_path);
-                println!("Текст: \"{}\"\n", highlighted_text);
+                if verbose {
+                    println!("Текст: \"{}\"\n", highlighted_text);
+                }
             }
         }
         _ => {}
