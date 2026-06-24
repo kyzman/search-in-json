@@ -13,16 +13,20 @@ use std::time::Instant;
 #[derive(Parser, Debug, Clone)]
 #[command(name = "search")]
 struct Args {
+    /// Filepath with mask(if nedded). Supports recursion (ex. "**/*.json.gz")
     #[arg(short = 'f', long = "file")]
     file: String,
 
+    /// Search string in files
     #[arg(short = 's', long = "search")]
     search_query: String,
 
-    #[arg(short = 'm', long = "mono-colors")]
+    /// Do not use ansi inversions
+    #[arg(short = 'm', long = "mono", default_value_t = false)]
     mono: bool,
 
-    #[arg(short = 'v', long = "verbose")]
+    /// Print json values where serch string was found
+    #[arg(short = 'v', long = "verbose", default_value_t = false)]
     verbose: bool,
 }
 
