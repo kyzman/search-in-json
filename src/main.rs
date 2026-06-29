@@ -56,7 +56,7 @@ impl<'a, R: Read + Seek> ProgressReader<'a, R> {
                 .unwrap(),
         );
 
-        pb.set_message(format!("Unzip {}", filename));
+        pb.set_message(format!("Loading {}", filename));
 
         Ok(Self {
             inner,
@@ -85,7 +85,8 @@ impl<'a, R: Read + Seek> Read for ProgressReader<'a, R> {
 impl<'a, R> Drop for ProgressReader<'a, R> {
     fn drop(&mut self) {
         // Принудительно завершаем прогресс-бар, если он еще не завершен
-        self.pb.finish_with_message(format!("{}", self.filename));
+        self.pb
+            .finish_with_message(format!("Loaded {}", self.filename));
         self.pb.finish();
     }
 }
@@ -146,20 +147,31 @@ fn main() -> Result<(), std::io::Error> {
                     "Имя файла содержит некорректные UTF-8 символы и не может быть отображено!"
                 );
             };
-            let mut buf = String::new();
-
+            let mut out: Value;
             {
+                let mut buf = String::new();
+
+                // {
                 // Для корректной работы progress-bar создаём отдельную область видимости, по выходу из которой всё корректно завершается, а не "висит" до тех пор, пока не будет обработано.
                 let progress_reader = ProgressReader::new(tar_gz, size, filename)?;
                 let mut tar = GzDecoder::new(progress_reader);
 
                 tar.read_to_string(&mut buf)?;
                 std::io::stdout().flush().unwrap();
+                // }
+
+                out = serde_json::from_str(&buf)?;
             }
+            let pbs = ProgressBar::new_spinner();
+            pbs.set_message("Search");
+            pbs.set_style(
+                ProgressStyle::default_spinner()
+                    .tick_strings(&["-", "\\", "|", "/", " "])
+                    .template("{msg} {spinner:.green}")
+                    .unwrap(),
+            );
 
-            let mut out: Value = serde_json::from_str(&buf)?;
-
-            clean_json_value(&mut out); // Очистка JSON для корректного отображения и поиска
+            clean_json_value(&mut out, &pbs); // Очистка JSON для корректного отображения и поиска
             // pbm.inc(size);
             let elapsed = start.elapsed();
             if !args.quiet {
@@ -171,10 +183,12 @@ fn main() -> Result<(), std::io::Error> {
                 println!("Результаты поиска для: \"{}\"\n", args.search_query);
             }
             // 3. Запуск поиска от корня ("$")
-            search_in_json(&out, "$", &args, filename);
+            search_in_json(&out, "$", &args, filename, &pbs);
             // println!("{}", serde_json::to_string_pretty(&out)?);
             // let mut archive = Archive::new(tar);
             // archive.unpack(".")?;
+            pbs.finish_with_message("Finished");
+            pbs.finish();
             let elapsed = start.elapsed();
             if !args.quiet {
                 println!(
@@ -182,7 +196,6 @@ fn main() -> Result<(), std::io::Error> {
                     elapsed.as_secs_f64()
                 );
             }
-            drop(buf);
         }
         // pbm.finish_with_message("✅ Обработка завершена");
         // pbm.finish();
@@ -197,7 +210,8 @@ fn main() -> Result<(), std::io::Error> {
     Ok(())
 }
 
-fn clean_json_value(value: &mut Value) {
+fn clean_json_value(value: &mut Value, pb: &ProgressBar) {
+    pb.tick();
     match value {
         // Если это строка, пробуем распарсить её как внутренний JSON
         Value::String(s) => {
@@ -205,32 +219,38 @@ fn clean_json_value(value: &mut Value) {
             if let Ok(inner_value) = serde_json::from_str::<Value>(s) {
                 let mut decoded_inner = inner_value;
                 // Рекурсивно чистим то, что было внутри этой строки
-                clean_json_value(&mut decoded_inner);
+                clean_json_value(&mut decoded_inner, pb);
                 *value = decoded_inner;
             }
         }
         // Если это массив, чистим каждый элемент
         Value::Array(arr) => {
             for item in arr {
-                clean_json_value(item);
+                clean_json_value(item, pb);
             }
         }
         // Если это объект, чистим каждое значение по ключу
         Value::Object(obj) => {
             for (_key, val) in obj.iter_mut() {
-                clean_json_value(val);
+                clean_json_value(val, pb);
             }
         }
         _ => {}
     }
 }
 
-fn search_in_json(value: &Value, current_path: &str, args: &Args, filename: &str) {
+fn search_in_json(
+    value: &Value,
+    current_path: &str,
+    args: &Args,
+    filename: &str,
+    pb: &ProgressBar,
+) -> bool {
     if args.search_query.is_empty() {
-        return;
+        return false;
     }
     let query_lowercase = args.search_query.to_lowercase();
-
+    pb.tick();
     match value {
         Value::Object(obj) => {
             for (key, val) in obj {
@@ -241,23 +261,27 @@ fn search_in_json(value: &Value, current_path: &str, args: &Args, filename: &str
                     let highlighted_key = highlight_match(key, &query_lowercase, args.mono);
                     println!("[Найдено в КЛЮЧЕ файла {}]", filename);
                     // Подсвечиваем совпадение в самом пути
-                    if !args.quiet {
-                        println!("Путь: {}.{}", current_path, highlighted_key);
+                    if args.quiet {
+                        return true;
                     } else {
-                        return;
+                        println!("Путь: {}.{}", current_path, highlighted_key);
                     }
                     if args.verbose {
                         println!("Значение по этому ключу: {}\n", truncate_value(val))
                     };
                 }
 
-                search_in_json(val, &next_path, args, filename);
+                if search_in_json(val, &next_path, args, filename, pb) {
+                    return true;
+                }
             }
         }
         Value::Array(arr) => {
             for (index, item) in arr.iter().enumerate() {
                 let next_path = format!("{}[{}]", current_path, index);
-                search_in_json(item, &next_path, args, filename);
+                if search_in_json(item, &next_path, args, filename, pb) {
+                    return true;
+                }
             }
         }
         Value::String(s) => {
@@ -268,7 +292,7 @@ fn search_in_json(value: &Value, current_path: &str, args: &Args, filename: &str
                 if !args.quiet {
                     println!("Путь: {}", current_path);
                 } else {
-                    return;
+                    return true;
                 }
                 if args.verbose {
                     println!("Текст: \"{}\"\n", highlighted_text);
@@ -277,6 +301,7 @@ fn search_in_json(value: &Value, current_path: &str, args: &Args, filename: &str
         }
         _ => {}
     }
+    false
 }
 
 /// Функция для инвертирования цвета подстроки с сохранением оригинального регистра букв
