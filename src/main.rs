@@ -3,10 +3,11 @@ extern crate flate2;
 use clap::Parser;
 use flate2::read::GzDecoder;
 use glob::glob;
+use indicatif::{ProgressBar, ProgressStyle};
 use serde_json;
 use serde_json::Value;
 use std::fs::File;
-use std::io::{IsTerminal, Read, stdout};
+use std::io::{self, IsTerminal, Read, Seek, Write, stdout};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -22,73 +23,169 @@ struct Args {
     search_query: String,
 
     /// Do not use ansi inversions
-    #[arg(short = 'm', long = "mono", default_value_t = false)]
+    #[arg(short = 'm', long = "mono", default_value_t = if stdout().is_terminal() { false } else { true })]
     mono: bool,
 
     /// Print json values where serch string was found
     #[arg(short = 'v', long = "verbose", default_value_t = false)]
     verbose: bool,
+
+    /// Quiet fast mode (only progress and files where found)
+    #[arg(short = 'q', long = "quiet", default_value_t = false)]
+    quiet: bool,
+}
+
+// Обертка над Read-потоком для подсчета прочитанных байт
+struct ProgressReader<'a, R> {
+    inner: R,
+    total: u64,
+    current: u64,
+    filename: &'a str,
+    pb: ProgressBar,
+}
+
+impl<'a, R: Read + Seek> ProgressReader<'a, R> {
+    fn new(mut inner: R, total: u64, filename: &'a str) -> io::Result<Self> {
+        let pb = ProgressBar::new(total);
+
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{msg} {spinner:.green} [{bar:20.cyan/blue}] ({percent}%) {elapsed_hhmmss}",
+                )
+                .unwrap(),
+        );
+
+        pb.set_message(format!("Unzip {}", filename));
+
+        Ok(Self {
+            inner,
+            total,
+            filename,
+            current: 0,
+            pb,
+        })
+    }
+}
+
+impl<'a, R: Read + Seek> Read for ProgressReader<'a, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.current += n as u64;
+            // Обновляем прогресс-бар
+            std::io::stdout().flush().unwrap();
+            self.pb.set_position(self.current);
+            std::io::stdout().flush().unwrap();
+        }
+        Ok(n)
+    }
+}
+
+impl<'a, R> Drop for ProgressReader<'a, R> {
+    fn drop(&mut self) {
+        // Принудительно завершаем прогресс-бар, если он еще не завершен
+        self.pb.finish_with_message(format!("{}", self.filename));
+        self.pb.finish();
+    }
 }
 
 fn main() -> Result<(), std::io::Error> {
     let total_start = Instant::now();
     let args = Args::parse();
-    let mut use_colors = false;
-    // Проверяем, поддерживает ли окружение цвета (is_terminal вернет false при перенаправлении в файл)
-    if !args.mono {
-        use_colors = stdout().is_terminal();
-    }
-    let mask = args.file;
+    // let mut use_colors = false;
+    // // Проверяем, поддерживает ли окружение цвета (is_terminal вернет false при перенаправлении в файл)
+    // if !args.mono {
+    //     use_colors = stdout().is_terminal();
+    // }
+    let mask = &args.file;
 
     //  Если вы захотите искать файлы *.json.gz не только в папке temp, но и во всех её подпапках, вам достаточно просто изменить строку на r"C:\temp\**\*.json.gz". Две звездочки ** включают глубокое сканирование.
-    let found_files = find_files_by_pattern(&mask);
+    let (found_files, total) = find_files_by_pattern(&mask);
     if found_files.is_empty() {
         println!("Файлы не найдены.");
     } else {
-        println!("Найдено файлов: {}", found_files.len());
+        if !args.quiet {
+            println!("Найдено файлов: {}", found_files.len())
+        };
+        // let pbm = ProgressBar::new(total as u64);
+        // pbm.set_style(
+        //     ProgressStyle::default_bar()
+        //         .template(
+        //             "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+        //         )
+        //         .unwrap()
+        //         .progress_chars("=>-"),
+        // );
+
         for path in found_files {
             let start = Instant::now();
-            println!("Загрузка и распаковка {}", path.display());
+            let mut size = 0;
+            if !args.quiet {
+                println!("Загрузка и распаковка {}", path.display());
+            };
+            // Пытаемся получить метаданные и размер
             let tar_gz = File::open(&path)?;
-            let mut tar = GzDecoder::new(tar_gz);
-            let mut buf = String::new();
-            tar.read_to_string(&mut buf)?;
-            let mut out: Value = serde_json::from_str(&buf)?;
+            match tar_gz.metadata() {
+                Ok(metadata) => {
+                    size = metadata.len();
+                    // println!("Найден файл: {:?}, размер: {} байт", path, size);
+                }
+                Err(e) => {
+                    // Файл существовал при сканировании glob, но сейчас недоступен
+                    eprintln!("Не удалось получить размер для {:?}: {}", path, e);
+                }
+            }
 
-            clean_json_value(&mut out); // Очистка JSON для корректного отображения и поиска
-
-            let elapsed = start.elapsed();
-            println!("{:.5} сек.", elapsed.as_secs_f64());
-
-            let start = Instant::now();
-            println!("Результаты поиска для: \"{}\"\n", args.search_query);
-
-            // 3. Запуск поиска от корня ("$")
+            // std::io::stdout().flush().unwrap();
             let mut filename: &str = "";
             if let Some(filename_str) = path.file_name().and_then(|os_str| os_str.to_str()) {
                 filename = filename_str;
             } else {
-                println!("Имя файла содержит некорректные UTF-8 символы!");
+                eprintln!(
+                    "Имя файла содержит некорректные UTF-8 символы и не может быть отображено!"
+                );
             };
-            search_in_json(
-                &out,
-                &args.search_query,
-                "$",
-                use_colors,
-                args.verbose,
-                filename,
-            );
+            let mut buf = String::new();
+
+            {
+                // Для корректной работы progress-bar создаём отдельную область видимости, по выходу из которой всё корректно завершается, а не "висит" до тех пор, пока не будет обработано.
+                let progress_reader = ProgressReader::new(tar_gz, size, filename)?;
+                let mut tar = GzDecoder::new(progress_reader);
+
+                tar.read_to_string(&mut buf)?;
+                std::io::stdout().flush().unwrap();
+            }
+
+            let mut out: Value = serde_json::from_str(&buf)?;
+
+            clean_json_value(&mut out); // Очистка JSON для корректного отображения и поиска
+            // pbm.inc(size);
+            let elapsed = start.elapsed();
+            if !args.quiet {
+                println!("{:.5} сек.", elapsed.as_secs_f64());
+            }
+
+            let start = Instant::now();
+            if !args.quiet {
+                println!("Результаты поиска для: \"{}\"\n", args.search_query);
+            }
+            // 3. Запуск поиска от корня ("$")
+            search_in_json(&out, "$", &args, filename);
             // println!("{}", serde_json::to_string_pretty(&out)?);
             // let mut archive = Archive::new(tar);
             // archive.unpack(".")?;
             let elapsed = start.elapsed();
-            println!(
-                "--- Поиск в файле {filename} занял {:.5} сек.",
-                elapsed.as_secs_f64()
-            );
+            if !args.quiet {
+                println!(
+                    "--- Поиск в файле {filename} занял {:.5} сек.",
+                    elapsed.as_secs_f64()
+                );
+            }
             drop(buf);
-            drop(tar);
         }
+        // pbm.finish_with_message("✅ Обработка завершена");
+        // pbm.finish();
     }
 
     let total_elapsed = total_start.elapsed();
@@ -128,18 +225,11 @@ fn clean_json_value(value: &mut Value) {
     }
 }
 
-fn search_in_json(
-    value: &Value,
-    query: &str,
-    current_path: &str,
-    use_colors: bool,
-    verbose: bool,
-    filename: &str,
-) {
-    if query.is_empty() {
+fn search_in_json(value: &Value, current_path: &str, args: &Args, filename: &str) {
+    if args.search_query.is_empty() {
         return;
     }
-    let query_lowercase = query.to_lowercase();
+    let query_lowercase = args.search_query.to_lowercase();
 
     match value {
         Value::Object(obj) => {
@@ -148,31 +238,39 @@ fn search_in_json(
 
                 // А. Проверка КЛЮЧА
                 if key.to_lowercase().contains(&query_lowercase) {
-                    let highlighted_key = highlight_match(key, &query_lowercase, use_colors);
+                    let highlighted_key = highlight_match(key, &query_lowercase, args.mono);
                     println!("[Найдено в КЛЮЧЕ файла {}]", filename);
                     // Подсвечиваем совпадение в самом пути
-                    println!("Путь: {}.{}", current_path, highlighted_key);
-                    if verbose {
+                    if !args.quiet {
+                        println!("Путь: {}.{}", current_path, highlighted_key);
+                    } else {
+                        return;
+                    }
+                    if args.verbose {
                         println!("Значение по этому ключу: {}\n", truncate_value(val))
                     };
                 }
 
-                search_in_json(val, query, &next_path, use_colors, verbose, filename);
+                search_in_json(val, &next_path, args, filename);
             }
         }
         Value::Array(arr) => {
             for (index, item) in arr.iter().enumerate() {
                 let next_path = format!("{}[{}]", current_path, index);
-                search_in_json(item, query, &next_path, use_colors, verbose, filename);
+                search_in_json(item, &next_path, args, filename);
             }
         }
         Value::String(s) => {
             // Б. Проверка ЗНАЧЕНИЯ
             if s.to_lowercase().contains(&query_lowercase) {
-                let highlighted_text = highlight_match(s, &query_lowercase, use_colors);
+                let highlighted_text = highlight_match(s, &query_lowercase, args.mono);
                 println!("[Найдено в ЗНАЧЕНИИ файла {}]", filename);
-                println!("Путь: {}", current_path);
-                if verbose {
+                if !args.quiet {
+                    println!("Путь: {}", current_path);
+                } else {
+                    return;
+                }
+                if args.verbose {
                     println!("Текст: \"{}\"\n", highlighted_text);
                 }
             }
@@ -221,9 +319,9 @@ fn truncate_value(val: &Value) -> String {
     }
 }
 
-fn find_files_by_pattern(pattern: &str) -> Vec<PathBuf> {
+fn find_files_by_pattern(pattern: &str) -> (Vec<PathBuf>, u64) {
     let mut found_files = Vec::new();
-
+    let mut total: u64 = 0;
     // Функция glob сама разберет "C:\temp\*.json.gz" на каталог и маску.
     // Она также поддерживает рекурсивный поиск, если указать "**/*.json.gz".
     match glob(pattern) {
@@ -232,8 +330,10 @@ fn find_files_by_pattern(pattern: &str) -> Vec<PathBuf> {
                 match entry {
                     Ok(path) => {
                         // Проверяем, что это файл, а не папка
-                        if path.is_file() {
+                        let metadata = path.metadata().expect("file read error!");
+                        if metadata.is_file() {
                             found_files.push(path);
+                            total += metadata.len();
                         }
                     }
                     // Игнорируем ошибки чтения конкретных файлов (например, проблемы с правами доступа)
@@ -246,5 +346,5 @@ fn find_files_by_pattern(pattern: &str) -> Vec<PathBuf> {
         }
     }
 
-    found_files
+    (found_files, total)
 }
