@@ -94,17 +94,12 @@ impl<'a, R> Drop for ProgressReader<'a, R> {
 fn main() -> Result<(), std::io::Error> {
     let total_start = Instant::now();
     let args = Args::parse();
-    // let mut use_colors = false;
-    // // Проверяем, поддерживает ли окружение цвета (is_terminal вернет false при перенаправлении в файл)
-    // if !args.mono {
-    //     use_colors = stdout().is_terminal();
-    // }
     let mask = &args.file;
 
     //  Если вы захотите искать файлы *.json.gz не только в папке temp, но и во всех её подпапках, вам достаточно просто изменить строку на r"C:\temp\**\*.json.gz". Две звездочки ** включают глубокое сканирование.
     let (found_files, total) = find_files_by_pattern(&mask);
     if found_files.is_empty() {
-        println!("Файлы не найдены.");
+        eprintln!("Файлы не найдены.");
     } else {
         if !args.quiet {
             println!("Найдено файлов: {}", found_files.len())
@@ -123,11 +118,11 @@ fn main() -> Result<(), std::io::Error> {
             let start = Instant::now();
             let mut size = 0;
             if !args.quiet {
-                println!("Загрузка и распаковка {}", path.display());
+                println!("\nЗагрузка и распаковка {}", path.display());
             };
             // Пытаемся получить метаданные и размер
-            let tar_gz = File::open(&path)?;
-            match tar_gz.metadata() {
+            let json_gz = File::open(&path)?;
+            match json_gz.metadata() {
                 Ok(metadata) => {
                     size = metadata.len();
                     // println!("Найден файл: {:?}, размер: {} байт", path, size);
@@ -138,7 +133,6 @@ fn main() -> Result<(), std::io::Error> {
                 }
             }
 
-            // std::io::stdout().flush().unwrap();
             let mut filename: &str = "";
             if let Some(filename_str) = path.file_name().and_then(|os_str| os_str.to_str()) {
                 filename = filename_str;
@@ -148,19 +142,19 @@ fn main() -> Result<(), std::io::Error> {
                 );
             };
             let mut out: Value;
+            let unpacked_size: usize;
             {
-                let mut buf = String::new();
-
-                // {
                 // Для корректной работы progress-bar создаём отдельную область видимости, по выходу из которой всё корректно завершается, а не "висит" до тех пор, пока не будет обработано.
-                let progress_reader = ProgressReader::new(tar_gz, size, filename)?;
+
+                let mut buf = String::new();
+                let progress_reader = ProgressReader::new(json_gz, size, filename)?;
                 let mut tar = GzDecoder::new(progress_reader);
 
                 tar.read_to_string(&mut buf)?;
                 std::io::stdout().flush().unwrap();
-                // }
 
                 out = serde_json::from_str(&buf)?;
+                unpacked_size = buf.len();
             }
             let pbs = ProgressBar::new_spinner();
             pbs.set_message("Search");
@@ -175,12 +169,16 @@ fn main() -> Result<(), std::io::Error> {
             // pbm.inc(size);
             let elapsed = start.elapsed();
             if !args.quiet {
-                println!("{:.5} сек.", elapsed.as_secs_f64());
+                println!(
+                    "Загрузка и подготовака файла размером {} заняла {:.5} сек.",
+                    human_readable_size(unpacked_size as u64),
+                    elapsed.as_secs_f64()
+                );
             }
 
             let start = Instant::now();
             if !args.quiet {
-                println!("Результаты поиска для: \"{}\"\n", args.search_query);
+                println!("Ищем в {} фразу: \"{}\"", filename, args.search_query);
             }
             // 3. Запуск поиска от корня ("$")
             search_in_json(&out, "$", &args, filename, &pbs);
@@ -197,8 +195,6 @@ fn main() -> Result<(), std::io::Error> {
                 );
             }
         }
-        // pbm.finish_with_message("✅ Обработка завершена");
-        // pbm.finish();
     }
 
     let total_elapsed = total_start.elapsed();
@@ -370,6 +366,24 @@ fn find_files_by_pattern(pattern: &str) -> (Vec<PathBuf>, u64) {
             println!("Ошибка: Некорректный синтаксис шаблона поиска: {}", e);
         }
     }
-
     (found_files, total)
+}
+
+fn human_readable_size(bytes: u64) -> String {
+    if bytes == 0 {
+        return String::from("0b");
+    }
+
+    let mut size = bytes as f64;
+    let units = ["b", "Kb", "Mb", "Gb", "Tb"];
+    let mut unit_index = 0;
+
+    // Пока размер больше 1024 и у нас есть старшие единицы
+    while size >= 1024.0 && unit_index < units.len() - 1 {
+        size /= 1024.0;
+        unit_index += 1;
+    }
+
+    // Форматируем число, округляя до десятой доли
+    format!("{:.1}{}", size, units[unit_index])
 }
